@@ -22,7 +22,6 @@ from auth import hash_password, verify_password, create_access_token
 
 from jose import jwt, JWTError
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
 # ------------------------
 # ENV
@@ -44,29 +43,22 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # change in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ------------------------
-# Request Models
-# ------------------------
-class UserCreate(BaseModel):
-    username: str
-    password: str
-
-# ------------------------
 # Upload folder
 # ------------------------
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # ------------------------
-# OCR Loader
+# Lazy OCR Loader
 # ------------------------
 reader = None
 
@@ -80,11 +72,10 @@ def get_reader():
 # Load CSV
 # ------------------------
 try:
-    df = pd.read_csv("data/modified_medicine_data.csv")
+    df = pd.read_csv("backend/data/modified_medicine_data.csv")
     medicine_list = df["medicine_name"].str.lower().tolist()
-    print("CSV Loaded:", len(medicine_list))
 except Exception as e:
-    print("CSV error:", e)
+    print("CSV load error:", e)
     medicine_list = []
 
 # ------------------------
@@ -120,28 +111,27 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 def home():
     return {"message": "API Running"}
 
-# ✅ FIXED REGISTER (JSON)
+
 @app.post("/register")
-def register(user: UserCreate, db: Session = Depends(get_db)):
-    if len(user.password) < 6:
+def register(username: str, password: str, db: Session = Depends(get_db)):
+    if len(password) < 6:
         raise HTTPException(status_code=400, detail="Password too short")
 
-    if db.query(User).filter(User.username == user.username).first():
+    if db.query(User).filter(User.username == username).first():
         raise HTTPException(status_code=400, detail="Username exists")
 
-    new_user = User(
-        username=user.username,
-        password=hash_password(user.password)
-    )
-
-    db.add(new_user)
+    user = User(username=username, password=hash_password(password))
+    db.add(user)
     db.commit()
 
     return {"message": "Registered"}
 
-# LOGIN (same)
+
 @app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
     user = db.query(User).filter(User.username == form_data.username).first()
 
     if not user:
@@ -154,13 +144,14 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 
     return {"access_token": token, "token_type": "bearer"}
 
+
 # ------------------------
-# PREDICT
+# PREDICT (FIXED)
 # ------------------------
 @app.post("/predict")
 async def predict(
     file: UploadFile = File(...),
-    username: str = Depends(get_current_user),
+    username: str = Depends(get_current_user),  # ✅ FIXED
     db: Session = Depends(get_db)
 ):
     if not file.content_type.startswith("image/"):
@@ -201,11 +192,18 @@ async def predict(
         raw_text
     )))
 
-    clean_text = re.sub(r'[^a-zA-Z0-9\s-]', ' ', raw_text)
+    clean_text = re.sub(r'[^a-zA-Z0-9\s]', ' ', raw_text)
     clean_text = " ".join([w for w in clean_text.split() if len(w) > 2])
+    clean_text = " ".join(dict.fromkeys(clean_text.split()))
 
-    stopwords = {"tablet","capsule","dosage","use","only","store","keep","away","children"}
-    clean_text = " ".join([w for w in clean_text.split() if w not in stopwords])
+    stopwords = {
+        "tablet","capsule","dosage","use","only","store",
+        "keep","away","children","india"
+    }
+
+    clean_text = " ".join([
+        w for w in clean_text.split() if w not in stopwords
+    ])
 
     detected_text = clean_text.strip()
 
@@ -228,7 +226,7 @@ async def predict(
         )
 
         if med in detected_text:
-            score += 20
+            score += 10
 
         if score > best_score:
             best_score = score
@@ -241,12 +239,12 @@ async def predict(
         medicine_name = "Unknown"
         status = "Possible Fake"
 
+    # ✅ FIXED (store real user)
     scan = ScanHistory(
         username=username,
         medicine_name=medicine_name,
         detected_text=detected_text,
-        status=status,
-        image=file_path
+        status=status
     )
 
     db.add(scan)
@@ -258,6 +256,7 @@ async def predict(
         "detected_text": detected_text,
         "status": status
     }
+
 
 # ------------------------
 # HISTORY
